@@ -67,36 +67,41 @@ export class AgentBuilder extends BaseResource {
 
   /**
    * Creates a transform stream that parses binary chunks into JSON records.
+   *
+   * A single TextDecoder in streaming mode is required: network chunk boundaries
+   * can fall inside a multi-byte UTF-8 character, and decoding each chunk with a
+   * fresh decoder corrupts the split character on both sides. Records are only
+   * parsed once their terminating separator has arrived; the trailing partial
+   * record stays buffered until the next chunk (or flush).
    */
   private createRecordParserTransform(): TransformStream<ArrayBuffer, { type: string; payload: any }> {
-    let failedChunk: string | undefined = undefined;
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    const parseRecord = (record: string, controller: TransformStreamDefaultController<{ type: string; payload: any }>) => {
+      if (!record) return;
+      try {
+        controller.enqueue(JSON.parse(record));
+      } catch {
+        // Skip malformed records so one bad record doesn't block the rest of the stream
+      }
+    };
 
     return new TransformStream<ArrayBuffer, { type: string; payload: any }>({
-      start() {},
-      async transform(chunk, controller) {
-        try {
-          // Decode binary data to text
-          const decoded = new TextDecoder().decode(chunk);
+      transform(chunk, controller) {
+        buffer += decoder.decode(chunk, { stream: true });
 
-          // Split by record separator
-          const chunks = decoded.split(RECORD_SEPARATOR);
+        // Records before the last separator are complete; the tail stays buffered
+        const records = buffer.split(RECORD_SEPARATOR);
+        buffer = records.pop() ?? '';
 
-          // Process each chunk
-          for (const chunk of chunks) {
-            if (chunk) {
-              const newChunk: string = failedChunk ? failedChunk + chunk : chunk;
-              try {
-                const parsedChunk = JSON.parse(newChunk);
-                controller.enqueue(parsedChunk);
-                failedChunk = undefined;
-              } catch {
-                failedChunk = newChunk;
-              }
-            }
-          }
-        } catch {
-          // Silently ignore processing errors
+        for (const record of records) {
+          parseRecord(record, controller);
         }
+      },
+      flush(controller) {
+        buffer += decoder.decode();
+        parseRecord(buffer, controller);
       },
     });
   }
@@ -226,6 +231,9 @@ export class AgentBuilder extends BaseResource {
     let doneReading = false;
     // Buffer to accumulate partial chunks
     let buffer = '';
+    // Single decoder in streaming mode so multi-byte UTF-8 characters split
+    // across network chunks decode correctly
+    const decoder = new TextDecoder();
 
     try {
       while (!doneReading) {
@@ -238,7 +246,7 @@ export class AgentBuilder extends BaseResource {
 
         try {
           // Decode binary data to text
-          const decoded = value ? new TextDecoder().decode(value) : '';
+          const decoded = value ? decoder.decode(value, { stream: !done }) : decoder.decode();
 
           // Split the combined buffer and new data by record separator
           const chunks = (buffer + decoded).split(RECORD_SEPARATOR);
