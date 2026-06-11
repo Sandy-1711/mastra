@@ -385,6 +385,94 @@ describe('Workflow error deserialization', () => {
   });
 });
 
+describe('Run stream record parsing', () => {
+  const RS = '\x1E';
+  const encoder = new TextEncoder();
+
+  const makeRun = async (chunks: Uint8Array[]) => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const c of chunks) controller.enqueue(c);
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn((input: any) => {
+      const url = String(input);
+      if (url.includes('/create-run')) return Promise.resolve(createJsonResponse({ runId: 'r-1' }));
+      if (url.includes('/stream?')) return Promise.resolve(new Response(body, { status: 200 }));
+      return Promise.reject(new Error(`Unhandled fetch to ${url}`));
+    });
+    globalThis.fetch = fetchMock as any;
+
+    const wf = new Workflow({ baseUrl: 'http://localhost', retries: 0 } as ClientOptions, 'wf-1');
+    return wf.createRun();
+  };
+
+  const readAll = async (stream: ReadableStream<any>) => {
+    const reader = stream.getReader();
+    const records: any[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      records.push(value);
+    }
+    return records;
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('parses a record when a multi-byte character is split across network chunks', async () => {
+    // "🚀" is 4 bytes in UTF-8 — split the byte stream in the middle of it.
+    // A per-chunk TextDecoder corrupts both halves into U+FFFD and the record
+    // can never parse again (and used to poison every record after it).
+    const record = { type: 'workflow-step-result', payload: { id: 'step-1', status: 'success', output: '🚀 done' } };
+    const next = { type: 'workflow-finish', payload: { workflowStatus: 'success' } };
+    const bytes = encoder.encode(JSON.stringify(record) + RS + JSON.stringify(next) + RS);
+    const emojiStart = bytes.findIndex((_, i) => new TextDecoder().decode(bytes.slice(i, i + 4)) === '🚀');
+    const splitAt = emojiStart + 2; // inside the emoji's 4-byte sequence
+
+    const run = await makeRun([bytes.slice(0, splitAt), bytes.slice(splitAt)]);
+    const records = await readAll((await run.stream({ inputData: {} })) as ReadableStream<any>);
+
+    expect(records).toEqual([record, next]);
+  });
+
+  it('parses all records regardless of where the network chunk boundary falls', async () => {
+    const r1 = { type: 'log', payload: { msg: 'héllo 🚀' } };
+    const r2 = { type: 'result', payload: { ok: true } };
+    const bytes = encoder.encode(JSON.stringify(r1) + RS + JSON.stringify(r2) + RS);
+
+    for (let splitAt = 1; splitAt < bytes.length; splitAt++) {
+      const run = await makeRun([bytes.slice(0, splitAt), bytes.slice(splitAt)]);
+      const records = await readAll((await run.stream({ inputData: {} })) as ReadableStream<any>);
+      expect(records, `split at byte ${splitAt}`).toEqual([r1, r2]);
+    }
+  });
+
+  it('skips a malformed record without dropping subsequent records', async () => {
+    const good = { type: 'result', payload: { ok: true } };
+    const bytes = encoder.encode('{not json' + RS + JSON.stringify(good) + RS);
+
+    const run = await makeRun([bytes]);
+    const records = await readAll((await run.stream({ inputData: {} })) as ReadableStream<any>);
+
+    expect(records).toEqual([good]);
+  });
+
+  it('parses a final record that has no trailing separator', async () => {
+    const r1 = { type: 'log', payload: { msg: 'first' } };
+    const r2 = { type: 'result', payload: { ok: true } };
+    const bytes = encoder.encode(JSON.stringify(r1) + RS + JSON.stringify(r2));
+
+    const run = await makeRun([bytes]);
+    const records = await readAll((await run.stream({ inputData: {} })) as ReadableStream<any>);
+
+    expect(records).toEqual([r1, r2]);
+  });
+});
+
 describe('Workflow Client Methods', () => {
   let client: MastraClient;
   const clientOptions = {
